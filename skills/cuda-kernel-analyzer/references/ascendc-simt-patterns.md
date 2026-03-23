@@ -1,0 +1,289 @@
+# AscendC SIMT Kernel 编程模式参考
+
+本文档总结了 HierarchicalKV-ascend 项目中 AscendC SIMT kernel 的编程规范和常用模式，
+基于已完成的参考实现（`clear_kernel`, `find_and_update_kernel`, `init_table_kernel`, `insert_and_evict_kernel`）归纳而来。
+
+---
+
+## 1. 函数签名规范
+
+### 标准签名模板
+
+```cpp
+template <typename K = uint64_t, typename V = float, typename S = uint64_t>
+__simt_vf__ __aicore__
+LAUNCH_BOUND(THREAD_NUM) inline void {kernel_name}_vf(
+    GM_ADDR buckets_addr_gm,          // 哈希桶数组（全局内存）
+    GM_ADDR buckets_size_addr_gm,     // 桶大小数组（如需）
+    uint64_t capacity,                // 哈希表总容量（桶数 × 桶大小）
+    uint32_t bucket_capacity,         // 单桶最大 key 数
+    uint32_t dim,                     // value 向量维度
+    GM_ADDR keys_addr_gm,             // 输入 key 数组
+    // ... 其他 GM_ADDR 参数 ...
+    uint64_t n,                       // 本次操作的 key 数量
+    uint64_t thread_all,              // 总线程数（gridDim × blockDim）
+    uint64_t global_epoch,            // 当前 epoch（用于 score 计算）
+    uint32_t block_index,             // 当前 block 索引（对应 CUDA blockIdx.x）
+    uint32_t max_bucket_shift,        // 桶索引位移量（log2(bucket_capacity)）
+    uint64_t capacity_divisor_magic,  // 快速取模魔数
+    uint64_t capacity_divisor_shift   // 快速取模位移
+)
+```
+
+### 关键修饰符说明
+
+| 修饰符 | 含义 |
+|--------|------|
+| `__simt_vf__` | 标识函数为 AscendC SIMT VF（Vector Function）kernel |
+| `__aicore__` | 声明运行在 AI Core 上（对应 CUDA 的 `__global__` 或 `__device__`） |
+| `LAUNCH_BOUND(N)` | 声明 kernel 最大线程数，N 为 `THREAD_NUM`（通常 512 或 1024） |
+| `inline` | 必须声明为内联 |
+
+### THREAD_NUM 选择规则
+
+| CUDA kernel blockDim | AscendC THREAD_NUM |
+|---------------------|--------------------|
+| 256 | 512（向上取整到 AscendC 支持值） |
+| 512 | 512 |
+| 1024 | 1024 |
+
+惯例：
+- 涉及 key-value 遍历操作（find/insert/evict）：`THREAD_NUM = 512`
+- 简单批量初始化/清空操作：`THREAD_NUM = 1024`
+
+---
+
+## 2. 全局内存参数（GM_ADDR）
+
+### 参数声明规则
+
+所有来自主机分配（aclrtMalloc）的全局内存指针，在参数中必须声明为 `GM_ADDR` 类型：
+
+```cpp
+// ✅ 正确
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void my_kernel_vf(
+    GM_ADDR buckets_gm,
+    GM_ADDR keys_gm,
+    GM_ADDR values_gm,
+    uint64_t n,
+    ...
+)
+
+// ❌ 错误
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void my_kernel_vf(
+    Bucket<K,V,S>* buckets,  // 不能直接用指针类型
+    K* keys,
+    ...
+)
+```
+
+### 内部指针转换规则
+
+在函数体内，将 `GM_ADDR` 转换为带 `__gm__` 限定符的指针：
+
+```cpp
+// 读写型全局指针
+__gm__ Bucket<K, V, S>* __restrict__ buckets =
+    reinterpret_cast<__gm__ Bucket<K, V, S>*>(buckets_gm);
+
+// 只读型全局指针（对应 CUDA 的 const T*）
+__gm__ const K* __restrict__ keys =
+    reinterpret_cast<__gm__ const K*>(keys_gm);
+
+// 标量输出
+__gm__ bool* __restrict__ founds =
+    reinterpret_cast<__gm__ bool*>(founds_gm);
+
+// 指针数组（如 V** value_ptrs）
+__gm__ V* __gm__* __restrict__ value_ptrs =
+    reinterpret_cast<__gm__ V* __gm__*>(value_ptrs_gm);
+
+// 整型指针
+__gm__ int32_t* __restrict__ buckets_size =
+    reinterpret_cast<__gm__ int32_t*>(buckets_size_addr_gm);
+```
+
+> **核心规则**：函数体内所有全局内存指针赋值必须带 `__gm__` 限定符，禁止省略。
+
+---
+
+## 3. 线程索引模式
+
+### 基础线程 ID 计算
+
+```cpp
+// AscendC（block_index 作为参数传入，不使用 blockIdx）
+uint64_t kv_idx = (uint64_t)block_index * blockDim.x + threadIdx.x;
+
+// 步进式遍历（处理 n > total_thread_num 的情况）
+for (uint64_t kv_idx = block_index * blockDim.x + threadIdx.x;
+     kv_idx < n; kv_idx += total_thread_num) {
+    // 每线程处理一个 key
+}
+```
+
+### 对比 CUDA
+
+```cpp
+// CUDA（不允许在 AscendC 中使用）
+int tid = blockIdx.x * blockDim.x + threadIdx.x;
+int stride = gridDim.x * blockDim.x;
+```
+
+---
+
+## 4. 原子操作
+
+### Compare-And-Swap
+
+```cpp
+// 抢占 key 位置（将 EMPTY_KEY 替换为 LOCKED_KEY）
+K prev = Simt::AtomicCas(current_key_ptr, EMPTY_KEY, LOCKED_KEY);
+if (prev == EMPTY_KEY) {
+    // 成功抢占，可以写入
+}
+
+// 抢占已有 key（确保同一 key 不被多线程同时写）
+K prev = Simt::AtomicCas(current_key_ptr, existing_key, LOCKED_KEY);
+if (prev == existing_key) {
+    // 成功抢占
+}
+```
+
+### Add
+
+```cpp
+// 递增桶大小
+atomicAdd(bucket_size, 1);
+
+// 获取淘汰位置
+uint64_t evicted_idx = atomicAdd(d_evicted_counter, 1UL);
+```
+
+---
+
+## 5. 哈希定位模式（标准模板）
+
+```cpp
+// 1. 计算哈希值
+const K hashed_key = Murmur3HashDevice(key);
+
+// 2. 快速取模定位全局槽位（capacity_divisor_magic/shift 避免除法）
+uint64_t global_idx = get_global_idx(hashed_key,
+                                      capacity_divisor_magic,
+                                      capacity_divisor_shift,
+                                      capacity);
+
+// 3. 分解为桶索引和桶内位置
+uint32_t key_pos = global_idx & (bucket_capacity - 1);   // 桶内初始位置
+uint64_t bkt_idx = global_idx >> max_bucket_shift;        // 桶索引
+
+// 4. 获取桶指针
+__gm__ Bucket<K, V, S>* bucket = buckets + bkt_idx;
+__gm__ K* bucket_keys = bucket->keys_;
+__gm__ V* bucket_values = bucket->vectors;
+__gm__ S* bucket_scores = bucket->scores_;
+
+// 5. 线性探测
+for (uint32_t offset = 0; offset < bucket_capacity; offset++) {
+    uint32_t current_pos = (key_pos + offset) % bucket_capacity;
+    auto current_key_ptr = bucket_keys + current_pos;
+    K current_key = *current_key_ptr;
+    // 判断：找到目标 key / 找到空位 / 继续探测
+}
+```
+
+---
+
+## 6. 空指针保护
+
+在 kernel 函数开头，必须对关键指针参数做空值保护：
+
+```cpp
+// 示例：find_and_update_kernel_vf
+if (buckets_gm == nullptr) return;
+if (keys_gm == nullptr) return;
+if (value_ptrs_gm == nullptr) return;
+```
+
+---
+
+## 7. INVALID_KEY_POS 模式
+
+用于标识"未找到目标位置"的哨兵值：
+
+```cpp
+constexpr uint32_t INVALID_KEY_POS = UINT32_MAX;  // 定义在 types.h 中
+
+uint32_t target_pos = INVALID_KEY_POS;
+
+// 线性探测后
+if (target_pos == INVALID_KEY_POS) {
+    // 未找到目标位置，根据 kernel 语义决定处理方式
+}
+```
+
+---
+
+## 8. 完整的函数头文件模板
+
+```cpp
+/**
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * ...
+ */
+
+#ifndef ASCENDC_{KERNEL_NAME_UPPER}_KERNEL_H_
+#define ASCENDC_{KERNEL_NAME_UPPER}_KERNEL_H_
+
+#include <kernel_operator.h>
+#include <cstdint>
+#include "../../../include/types.h"
+#include "../../../include/utils.h"
+// 仅在使用 ScoreFunctor 时包含：
+// #include "../../../include/score_functor.h"
+
+namespace npu {
+namespace hkv {
+using namespace AscendC;
+
+constexpr uint32_t THREAD_NUM = 512;
+
+template <typename K = uint64_t, typename V = float, typename S = uint64_t>
+__simt_vf__ __aicore__
+LAUNCH_BOUND(THREAD_NUM) inline void {kernel_name}_vf(
+    // 参数列表
+) {
+  // 空指针检查
+  // ...
+
+  // GM_ADDR → __gm__ 指针转换
+  // ...
+
+  // 主循环（步进式线程遍历）
+  for (uint64_t kv_idx = block_index * blockDim.x + threadIdx.x;
+       kv_idx < n; kv_idx += total_thread_num) {
+    // 每线程处理逻辑
+  }
+}
+
+}  // namespace hkv
+}  // namespace npu
+
+#endif  // ASCENDC_{KERNEL_NAME_UPPER}_KERNEL_H_
+```
+
+---
+
+## 9. 已完成参考 kernel 一览
+
+| Kernel | 文件路径 | 核心操作 |
+|--------|----------|----------|
+| `clear_kernel_vf` | `hkv_hashtable/clear_kernel/v35/clear_kernel.h` | 遍历所有槽位，写入 EMPTY_KEY/EMPTY_SCORE，重置桶大小 |
+| `find_and_update_kernel_vf` | `hkv_hashtable/find_and_update_kernel/v35/find_and_update_kernel.h` | 哈希定位 → 线性探测 → 返回 value 指针和 found 标志 |
+| `init_table_kernel` (多函数) | `hkv_hashtable/init_table_kernel/v35/init_table_kernel.h` | 初始化桶指针、填充 EMPTY_KEY/EMPTY_SCORE |
+| `insert_and_evict_kernel_vf` | `hkv_hashtable/insert_and_evict_kernel/v35/insert_and_evict_kernel.h` | 插入 key，满时按 score 淘汰最旧 key |
+
+在生成新 kernel 时，优先参考**功能最相似**的已有实现作为代码风格模板。
