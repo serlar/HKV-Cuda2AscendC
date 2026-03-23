@@ -38,21 +38,13 @@
 #include "aclrtlaunch_create_atomic_scores_kernel.h"
 #include "aclrtlaunch_find_and_update_kernel.h"
 #include "aclrtlaunch_find_and_update_kernel_with_filter.h"
-#include "aclrtlaunch_find_or_insert_ptr_kernel.h"
-#include "aclrtlaunch_find_or_insert_ptr_kernel_v2.h"
-#include "aclrtlaunch_find_ptr_kernel.h"
-#include "aclrtlaunch_find_ptr_with_digest_kernel.h"
 #include "aclrtlaunch_get_bucket_others_address_kernel.h"
 #include "aclrtlaunch_host_nano_kernel.h"
-#include "aclrtlaunch_insert_or_assign_kernel.h"
-#include "aclrtlaunch_insert_or_assign_kernel_with_thread_1024.h"
 #ifndef USE_DUMP_KERNEL_ASC
 #include "aclrtlaunch_dump_kernel.h"
 #endif
 #include "aclnn_helper.h"
 #include "aclnnop/aclnn_reduce_sum.h"
-#include "aclrtlaunch_assign_scores_kernel.h"
-#include "aclrtlaunch_assign_scores_kernel_with_filter.h"
 #include "aclrtlaunch_rehash_kernel.h"
 #include "aclrtlaunch_insert_and_evict_kernel.h"
 #include "bucket_memory_pool_manager.h"
@@ -1082,35 +1074,7 @@ class HashTable : public HashTableBase<K, V, S> {
       return;
     }
 
-    while (!reach_max_capacity_ &&
-           fast_load_factor(n, stream) > options_.max_load_factor) {
-      reserve(capacity() * 2, stream);
-    }
-
-    if (!ignore_evict_strategy) {
-      check_evict_strategy(scores);
-    }
-
-    uint64_t n_align_warp = ((n + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-    if (value_move_opt_.is_large_size) {
-      ACLRT_LAUNCH_KERNEL(insert_or_assign_kernel_with_thread_1024)(
-          block_dim_, stream, table_->buckets, table_->buckets_size,
-          table_->capacity, table_->bucket_max_size, value_move_opt_.dim,
-          const_cast<key_type*>(keys), const_cast<value_type*>(values),
-          const_cast<score_type*>(scores), n, global_epoch_, evict_strategy_,
-          value_move_opt_.size, table_->max_bucket_shift, table_->capacity_divisor_magic,
-          table_->capacity_divisor_shift, n_align_warp, value_move_opt_.cg_size);
-    } else {
-      ACLRT_LAUNCH_KERNEL(insert_or_assign_kernel)(
-          block_dim_, stream, table_->buckets, table_->buckets_size,
-          table_->capacity, table_->bucket_max_size, value_move_opt_.dim,
-          const_cast<key_type*>(keys), const_cast<value_type*>(values),
-          const_cast<score_type*>(scores), n, global_epoch_, evict_strategy_,
-          value_move_opt_.size, table_->max_bucket_shift, table_->capacity_divisor_magic,
-          table_->capacity_divisor_shift, n_align_warp, value_move_opt_.cg_size);
-    }
-
-    NpuCheckError();
+    throw std::runtime_error("insert_or_assign_kernel/insert_or_assign_kernel_with_thread_1024 该 kernel 未实现");
   }
 
   /**
@@ -1354,9 +1318,7 @@ class HashTable : public HashTableBase<K, V, S> {
       return;
     }
 
-    std::cout << "[Unsupport find_or_insert yet]\n";
-
-    NpuCheckError();
+    throw std::runtime_error("find_or_insert_ptr_kernel 该 kernel 未实现");
   }
 
   /**
@@ -1394,25 +1356,7 @@ class HashTable : public HashTableBase<K, V, S> {
       return;
     }
 
-    while (!reach_max_capacity_ &&
-           fast_load_factor(n, stream) > options_.max_load_factor) {
-      reserve(capacity() * 2, stream);
-    }
-
-    if (!ignore_evict_strategy) {
-      check_evict_strategy(scores);
-    }
-
-    uint64_t n_align_warp = ((n + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-    ACLRT_LAUNCH_KERNEL(find_or_insert_ptr_kernel_v2)
-    (block_dim_, stream, table_->buckets, table_->buckets_size,
-     table_->buckets_num, options_.max_bucket_size, value_move_opt_.dim,
-     (void*)keys, values, scores, locked_key_ptrs, n, founds, global_epoch_,
-     evict_strategy, value_move_opt_.size, table_->max_bucket_shift,
-     table_->capacity_divisor_magic, table_->capacity_divisor_shift,
-     n_align_warp, table_->capacity);
-
-    NpuCheckError();
+    throw std::runtime_error("find_or_insert_ptr_kernel_v2 该 kernel 未实现");
   }
 
   /**
@@ -1537,20 +1481,7 @@ class HashTable : public HashTableBase<K, V, S> {
       return;
     }
 
-    check_evict_strategy(scores);
-
-    constexpr uint32_t MinBucketCapacityFilter = sizeof(VecD_Load) / sizeof(D);
-    if (unique_key && options_.max_bucket_size >= MinBucketCapacityFilter) {
-      ACLRT_LAUNCH_KERNEL(assign_scores_kernel_with_filter)
-      (block_dim_, stream, table_->buckets, table_->capacity, options_.max_bucket_size,
-      options_.dim, (void*)keys, (void*)scores, n, global_epoch_, evict_strategy, value_size_,
-      table_->max_bucket_shift, table_->capacity_divisor_magic, table_->capacity_divisor_shift);
-    } else {
-      throw std::runtime_error(
-        "Not support update score when keys are not unique or bucket "
-        "capacity is smaller than " + std::to_string(MinBucketCapacityFilter) + ".");
-  }
-    NpuCheckError();
+    throw std::runtime_error("assign_scores_kernel_with_filter 该 kernel 未实现");
   }
 
   /**
@@ -1689,11 +1620,8 @@ class HashTable : public HashTableBase<K, V, S> {
     if (n == 0) {
       return;
     }
-    ACLRT_LAUNCH_KERNEL(find_ptr_with_digest_kernel)(
-      block_dim_, stream, table_->buckets, table_->capacity, table_->buckets_num, options_.max_bucket_size,
-      options_.dim, const_cast<key_type*>(keys), values, scores, founds, n, global_epoch_, value_size_,
-      table_->max_bucket_shift, table_->capacity_divisor_magic, table_->capacity_divisor_shift);
-    NpuCheckError();
+
+    throw std::runtime_error("find_ptr_with_digest_kernel 该 kernel 未实现");
   }
 
   /**

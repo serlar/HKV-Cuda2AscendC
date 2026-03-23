@@ -21,20 +21,12 @@ file(GLOB KERNEL_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/init_table_kernel/get_bucket_others_address_kernel.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/init_table_kernel/create_atomic_keys_kernel.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/init_table_kernel/create_atomic_scores_kernel.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/find_or_insert_ptr_kernel/find_or_insert_ptr_kernel.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/find_or_insert_ptr_kernel/find_or_insert_ptr_kernel_v2.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/find_ptr_kernel/find_ptr_kernel.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/find_ptr_kernel/find_ptr_with_digest_kernel.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/utils_kernel/read_from_ptr_kernel.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/utils_kernel/host_nano_kernel.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/insert_or_assign_kernel/insert_or_assign_kernel.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/insert_or_assign_kernel/insert_or_assign_kernel_with_thread_1024.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/clear_kernel/clear_kernel.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/rehash_kernel/rehash_kernel.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/find_and_update_kernel/find_and_update_kernel_with_filter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/find_and_update_kernel/find_and_update_kernel.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/assign_scores_kernel/assign_scores_kernel_with_filter.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/assign_scores_kernel/assign_scores_kernel.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/insert_and_evict_kernel/insert_and_evict_kernel.cpp
 )
 
