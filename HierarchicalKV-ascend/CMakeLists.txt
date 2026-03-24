@@ -28,6 +28,7 @@ file(GLOB KERNEL_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/find_and_update_kernel/find_and_update_kernel_with_filter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/find_and_update_kernel/find_and_update_kernel.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/insert_and_evict_kernel/insert_and_evict_kernel.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/find_or_insert_ptr_kernel_lock_key/find_or_insert_ptr_kernel_lock_key.cpp
 )
 
 if("${RUN_MODE}" STREQUAL "cpu")

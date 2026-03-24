@@ -5,18 +5,24 @@ description: >
   参考实现，生成完整的 AscendC SIMT 算子文件：
   1. v35/{kernel_name}_kernel.h — kernel 实现头文件
   2. {kernel_name}_kernel.cpp — 内核入口（dispatcher）文件
-  支持首次生成和基于错误反馈的迭代修复。
+  3. 自动集成到 HierarchicalKV-ascend 项目（修改 CMakeLists.txt 和 hkv_hashtable.h）
+  4. 自动编译验证，支持错误迭代修复（最多3次）
 argument-hint: >
-  输入：cuda_kernel_content（CUDA 文件内容）、kernel_name、output_path。
-  可选：previous_code、check_error、conductor_suggestion、user_requirements。
-  输出：完整算子目录结构（包含 .cpp 和 v35/.h 文件）。
+  输入：cuda_kernel_content（CUDA 文件内容）、kernel_name、output_path、target_project_path。
+  可选：previous_code、check_error、conductor_suggestion、user_requirements、calling_scenario、max_compile_attempts。
+  输出：完整算子目录结构，集成到目标项目，编译验证通过或失败报告。
 ---
 
-# AscendC SIMT Kernel 代码生成 Skill
+# AscendC SIMT Kernel 代码生成与集成 Skill
 
 <role>
-你是一个 AscendC SIMT kernel 代码生成专家，专注于将 CUDA SIMT kernel 迁移到 AscendC SIMT 实现。
+你是一个 AscendC SIMT kernel 代码生成与集成专家，专注于将 CUDA SIMT kernel 迁移到 AscendC SIMT 实现。
 你深入理解 HierarchicalKV 哈希表的数据结构，以及 CUDA 和 AscendC 之间的语义映射关系。
+你的职责包括：
+1. 生成符合规范的 AscendC kernel 代码（.h 和 .cpp）
+2. 将代码集成到 HierarchicalKV-ascend 项目（修改 CMakeLists.txt 和 hkv_hashtable.h）
+3. 编译验证生成的算子
+4. 分析编译错误并进行迭代修复（最多3次）
 </role>
 
 ## 输入信息
@@ -25,8 +31,10 @@ argument-hint: >
 
 1. **CUDA kernel 源码** — 待迁移的 CUDA `.cuh` 文件内容
 2. **kernel 名称** — 用于命名生成的函数和文件
-3. **AscendC 参考实现** — 已完成的同类 AscendC kernel，作为风格和模式参考
-4. **执行历史**（迭代生成时）— 上一轮代码和检查错误信息
+3. **output_path** — 默认输出目录（默认：`./output/`）
+4. **target_project_path** — HierarchicalKV-ascend 项目路径（默认：`./HierarchicalKV-ascend/`）
+5. **calling_scenario** — 调用场景（可选，由用户指定或 agent 自动分析）
+6. **编译历史**（迭代修复时）— 上一轮编译错误信息
 
 ## 知识加载规则
 
@@ -37,9 +45,40 @@ argument-hint: >
 - **HKV 数据结构参考**：`@references/hkv-data-structures.md`
   - Bucket 结构、常量定义、哈希函数、ScoreFunctor
 
+## 执行流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 1: 代码生成                                                │
+│  - 生成 {kernel_name}_kernel.cpp 和 v35/{kernel_name}_kernel.h    │
+│  - 输出到 output 目录                                             │
+└────────────────────────┬────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 2: 询问调用场景（如未指定）                                 │
+│  - 分析 CUDA kernel 功能，确定调用场景                             │
+│  - 询问用户确认或修改                                             │
+└────────────────────────┬────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 3: 集成到目标项目                                          │
+│  - 拷贝代码到 HierarchicalKV-ascend/hkv_hashtable/               │
+│  - 修改 CMakeLists.txt 添加 kernel 文件                           │
+│  - 修改 hkv_hashtable.h 添加 host 调用逻辑                        │
+└────────────────────────┬────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 4: 编译验证（最多3次迭代）                                  │
+│  - 执行 bash run.sh -v Ascend950PR_9579 -d 0 -c                  │
+│  - 分析编译错误                                                   │
+│  - 如果是新生成的算子错误，分析原因并修复                          │
+│  - 如果是其他错误，报告用户并结束                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
-## 代码生成模式
+## Phase 1: 代码生成
 
 ### 模式 1: 首次生成（无历史信息）
 
@@ -49,14 +88,334 @@ argument-hint: >
    - **输入输出**：哪些是输入（keys, scores），哪些是输出（values, founds, evicted_*）
 2. 参考同类 AscendC kernel 的风格（从 `@references/ascendc-simt-patterns.md` 获取模板）
 3. 逐步映射 CUDA 代码到 AscendC 等价实现（见下方映射表）
-4. 生成完整的 `.h` 文件
+4. 生成完整的 `.h` 和 `.cpp` 文件，保存到 output 目录
 
-### 模式 2: 迭代修复（有 check_error / conductor_suggestion）
+### 模式 2: 迭代修复（有编译错误）
 
-1. **分析错误**：仔细阅读 `check_error`，理解哪些规范项未通过
-2. **参考建议**：严格按照 `conductor_suggestion` 中的修复方向修改
-3. **保留正确部分**：只修改有问题的部分，保留正确的算法逻辑
-4. **针对性修复**：不做不必要的重构
+1. **分析错误**：仔细阅读编译错误日志，定位问题代码
+2. **分类错误**：
+   - 新生成的算子错误 → 修复代码
+   - 其他原因（环境、依赖等）→ 报告用户并结束
+3. **针对性修复**：只修改有问题的部分，保留正确的算法逻辑
+4. **重新生成**：更新代码并进入下一轮编译
+
+---
+
+## Phase 2: 调用场景分析与确认
+
+在集成代码之前，必须确定 host 调用 kernel 的方式。分析 CUDA kernel 的功能，确定以下调用场景参数：
+
+### 场景分析维度
+
+| 维度 | 选项 | 说明 |
+|------|------|------|
+| **Kernel 类型** | simple / with_digest / with_filter / with_evict | 是否使用 digest 优化、filter 条件、淘汰策略 |
+| **线程数** | 512 / 1024 | blockDim，影响 THREAD_NUM 常量 |
+| **Group Size** | 16 / 32 / 64 | 协作组大小，用于 insert_and_evict 类 kernel |
+| **淘汰策略** | LRU / LFU / EpochLru / EpochLfu / Customized | 涉及 ScoreFunctor 的 kernel |
+| **条件过滤** | 有 / 无 | 是否需要 filter 参数 |
+
+### 自动分析逻辑
+
+根据 CUDA kernel 的功能特征自动推断：
+
+```
+1. 如果 kernel 涉及 evicted_keys/evicted_values → 使用 insert_and_evict 场景
+2. 如果 kernel 使用 digest 进行快速过滤 → 使用 with_digest 变体
+3. 如果 kernel 有 filter 参数 → 使用 with_filter 变体
+4. 根据 CUDA blockDim 确定 THREAD_NUM（256→512, 512→512, 1024→1024）
+5. 根据 value 大小确定 group_size（小 value→16, 大 value→32/64）
+```
+
+### 用户确认
+
+生成场景分析报告，使用 `question` 工具询问用户：
+
+> 根据 CUDA kernel 分析，推荐的调用场景如下：
+>
+> - **Kernel 类型**: {类型}
+> - **线程数**: {THREAD_NUM}
+> - **Group Size**: {GROUP_SIZE}
+> - **淘汰策略**: {策略}
+> - **条件过滤**: {有/无}
+>
+> 该场景将生成以下 host 调用代码：
+> ```cpp
+> // 示例调用代码
+> ACLRT_LAUNCH_KERNEL({kernel_name})(...);
+> ```
+>
+> 请选择：
+> 1. 确认使用推荐场景
+> 2. 修改调用场景参数
+
+如果用户选择修改，进一步询问具体参数。
+
+---
+
+## Phase 3: 集成到目标项目
+
+### 3.1 代码拷贝
+
+将生成的代码从 output 目录拷贝到目标项目：
+
+```bash
+# 创建目标目录
+mkdir -p {target_project_path}/hkv_hashtable/{kernel_name}_kernel/v35/
+
+# 拷贝文件
+cp {output_path}/{kernel_name}_kernel.cpp {target_project_path}/hkv_hashtable/{kernel_name}_kernel/
+cp {output_path}/v35/{kernel_name}_kernel.h {target_project_path}/hkv_hashtable/{kernel_name}_kernel/v35/
+```
+
+### 3.2 修改 CMakeLists.txt
+
+读取 `{target_project_path}/CMakeLists.txt`，在 `file(GLOB KERNEL_FILES ...)` 列表中添加新生成的 kernel 文件：
+
+```cmake
+file(GLOB KERNEL_FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/init_table_kernel/init_table_kernel.cpp
+  ...
+  ${CMAKE_CURRENT_SOURCE_DIR}/hkv_hashtable/{kernel_name}_kernel/{kernel_name}_kernel.cpp
+)
+```
+
+**修改规则**：
+1. 找到 `file(GLOB KERNEL_FILES` 部分
+2. 在列表末尾添加新 kernel 的 cpp 文件路径
+3. 保持原有格式和缩进
+
+### 3.3 修改 hkv_hashtable.h
+
+读取 `{target_project_path}/include/hkv_hashtable.h`，根据现有代码结构进行相应修改：
+
+#### 修改前检查
+
+首先分析 hkv_hashtable.h 的当前状态：
+
+1. **检查是否已有虚函数声明**：搜索 `class HashTableBase` 中是否已有 `{kernel_name}` 相关的虚函数
+2. **检查是否已有实现函数**：搜索 `class HashTable` 中是否已有 `{kernel_name}` 的实现
+3. **检查是否有"暂不支持"标记**：搜索文件中是否有该 kernel 的占位符或 TODO 标记
+
+#### 场景 1：添加全新的 kernel
+
+如果文件中没有任何相关声明和实现：
+
+**1. 添加 aclrtlaunch 头文件 include**
+
+在文件顶部的 include 区域添加：
+
+```cpp
+#include "aclrtlaunch_{kernel_name}_kernel.h"
+```
+
+**2. 在 HashTableBase 中添加虚函数声明**
+
+找到 `class HashTableBase` 中的虚函数声明区域，添加对应的虚函数：
+
+```cpp
+virtual void {kernel_name}(const size_type n,
+                           const key_type* keys,
+                           // ... 其他参数
+                           aclrtStream stream = 0) = 0;
+```
+
+**3. 在 HashTable 中添加实现函数**
+
+根据调用场景，添加对应的实现（参考同类 kernel 的调用方式）：
+
+```cpp
+void {kernel_name}(const size_type n,
+                   const key_type* keys,
+                   // ... 其他参数
+                   aclrtStream stream = 0) {
+  // 参数检查
+  if (n == 0) return;
+
+  // 预处理逻辑
+  uint64_t n_align_warp = ((n + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+
+  // 调用 kernel
+  ACLRT_LAUNCH_KERNEL({kernel_name})(
+      block_dim_, stream, table_->buckets,
+      // ... 其他参数
+      n, global_epoch_, evict_strategy_,
+      value_move_opt_.size, table_->max_bucket_shift,
+      table_->capacity_divisor_magic, table_->capacity_divisor_shift,
+      n_align_warp, value_move_opt_.cg_size);
+
+  NpuCheckError();
+}
+```
+
+#### 场景 2：已有虚函数声明，需要添加/修改实现
+
+如果 `HashTableBase` 中已有虚函数声明，但 `HashTable` 中：
+- 没有实现函数 → 添加完整实现
+- 实现函数标记为"暂不支持" → 替换为正确的实现
+
+**处理"暂不支持"的情况**：
+
+查找文件中类似以下的代码：
+```cpp
+void {kernel_name}(...) {
+  // TODO: Not implemented yet
+  // 或
+  // 暂不支持
+  // 或
+  throw std::runtime_error("Not supported");
+}
+```
+
+替换为正确的 kernel 调用实现。
+
+#### 场景 3：修改现有实现以适配新生成的 kernel
+
+如果已有实现，但编译报错提示 kernel 签名不匹配，需要：
+
+1. 对比现有实现中的参数列表与新生成的 kernel 参数
+2. 调整 ACLRT_LAUNCH_KERNEL 调用中的参数
+3. 确保参数顺序和类型与新生成的 kernel 一致
+
+**修改规则**：
+1. 先搜索检查现有代码，确定当前状态（新添加 / 已声明待实现 / 已实现需修改）
+2. 根据当前状态选择合适的修改策略
+3. 参考同类 kernel 的调用方式（如 insert_or_assign、find_and_update 等）
+4. 参数列表与 kernel 函数签名一致
+5. 正确处理 ACLRT_LAUNCH_KERNEL 宏调用
+6. 添加必要的预处理和后处理逻辑
+7. 如果存在"暂不支持"的注释或 TODO，务必替换为实际实现
+
+---
+
+## Phase 4: 编译验证与迭代修复
+
+### 4.1 执行编译
+
+进入目标项目目录，执行编译命令：
+
+```bash
+cd {target_project_path}
+bash run.sh -v Ascend950PR_9579 -d 0 -c
+```
+
+### 4.2 错误分析
+
+捕获编译输出，分析错误类型：
+
+#### A 类：新生成的算子错误（可修复）
+
+特征：
+- 错误位置在生成的 `{kernel_name}_kernel.cpp` 或 `v35/{kernel_name}_kernel.h`
+- 语法错误、类型不匹配、缺少头文件等
+- 错误信息包含生成的文件名
+
+**处理方式**：
+1. 提取具体错误信息和位置
+2. 分析原因（如缺少 include、类型不匹配、API 调用错误等）
+3. 生成修复建议
+4. 进入下一轮迭代修复
+
+#### B 类：集成相关错误（可修复）
+
+特征：
+- CMakeLists.txt 语法错误
+- hkv_hashtable.h 中的调用方式错误
+- 头文件路径问题
+
+**处理方式**：
+1. 分析具体错误
+2. 修复集成代码
+3. 重新编译
+
+#### C 类：其他错误（不可修复，报告用户）
+
+特征：
+- 环境配置问题（CANN 未安装、版本不匹配等）
+- 依赖库缺失
+- 其他 kernel 的编译错误
+- 错误信息不包含生成的文件名
+
+**处理方式**：
+- 报告用户错误信息
+- 说明错误原因与新生成的算子无关
+- 结束流程
+
+### 4.3 迭代修复流程
+
+```
+编译次数 = 0
+最大次数 = 3
+
+while 编译次数 < 最大次数:
+    执行编译
+
+    if 编译成功:
+        报告成功
+        结束流程
+
+    分析错误
+
+    if 错误是 C 类（非生成算子导致）:
+        报告用户错误信息
+        结束流程
+
+    if 错误是 A 类或 B 类:
+        编译次数 += 1
+
+        if 编译次数 >= 最大次数:
+            报告生成失败
+            保留最后一次生成的代码和编译日志
+            结束流程
+
+        生成修复建议
+        修复代码
+        继续下一轮
+```
+
+### 4.4 失败报告
+
+如果 3 次编译都失败，生成失败报告：
+
+```markdown
+# AscendC Kernel 生成失败报告
+
+## 基本信息
+- **Kernel 名称**: {kernel_name}
+- **CUDA 源文件**: {cuda_source}
+- **生成时间**: {timestamp}
+
+## 编译尝试历史
+
+### 第 1 次尝试
+- **错误类型**: {类型}
+- **错误信息**:
+  ```
+  {error_log}
+  ```
+- **修复措施**: {措施}
+
+### 第 2 次尝试
+...
+
+### 第 3 次尝试
+...
+
+## 最终错误
+```
+{final_error}
+```
+
+## 保留的文件
+- 代码文件: {output_path}/{kernel_name}_kernel.cpp
+- 头文件: {output_path}/v35/{kernel_name}_kernel.h
+- 完整编译日志: {output_path}/compile.log
+
+## 建议
+1. 手动检查生成的代码
+2. 参考其他同类 kernel 的实现
+3. 检查编译环境配置
+```
 
 ---
 
@@ -121,7 +480,7 @@ argument-hint: >
 
 ## 输出要求
 
-必须生成**完整算子目录结构**，与参考实现一致：
+### 1. 初始输出目录结构
 
 ```
 {output_path}/
@@ -130,7 +489,23 @@ argument-hint: >
     └── {kernel_name}_kernel.h  # kernel 实现头文件
 ```
 
-### 1. v35/{kernel_name}_kernel.h 文件结构
+### 2. 目标项目集成后的结构
+
+```
+{target_project_path}/
+├── CMakeLists.txt              # 已添加新 kernel 文件
+├── include/
+│   └── hkv_hashtable.h         # 已添加 host 调用逻辑
+└── hkv_hashtable/
+    └── {kernel_name}_kernel/
+        ├── {kernel_name}_kernel.cpp
+        └── v35/
+            └── {kernel_name}_kernel.h
+```
+
+### 3. 文件模板
+
+#### v35/{kernel_name}_kernel.h 文件结构
 
 ```cpp
 /*
@@ -190,23 +565,14 @@ LAUNCH_BOUND(THREAD_NUM) inline void {kernel_name}_vf(
 #endif  // ASCENDC_{KERNEL_NAME_UPPER}_KERNEL_H_
 ```
 
-### 2. {kernel_name}_kernel.cpp 文件结构
+#### {kernel_name}_kernel.cpp 文件结构
 
 ```cpp
 /**
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * ...
  */
 
 #include "./v35/{kernel_name}_kernel.h"
@@ -250,7 +616,7 @@ extern "C" __global__ __aicore__ void {kernel_name}(
 }
 ```
 
-### 3. 关键约束
+### 4. 关键约束
 
 | 约束 | 说明 |
 |------|------|
@@ -268,14 +634,138 @@ extern "C" __global__ __aicore__ void {kernel_name}(
 
 ---
 
+## 10. HKV 数据访问方式（重要！）
+
+**严禁使用错误的数据访问方式！** 以下是 HKV 中各类数据的正确访问方法：
+
+### 10.1 Bucket 数据结构
+
+```cpp
+template <class K, class V, class S>
+struct Bucket {
+  __gm__ K* keys_;       // key 数组
+  __gm__ S* scores_;     // score 数组
+  __gm__ D* digests_;    // digest 数组（1字节摘要）
+  __gm__ V* vectors;     // value 向量数组
+
+  // 静态方法：获取 keys 指针
+  static __forceinline__ __device__ __gm__ K* keys(__gm__ K* keys, uint32_t offset);
+
+  // 静态方法：获取 digests 指针（重要！）
+  static __forceinline__ __device__ __gm__ D* digests(__gm__ K* keys,
+                                                      uint32_t bucket_capacity,
+                                                      uint32_t offset);
+
+  // 静态方法：获取 scores 指针
+  static __forceinline__ __device__ __gm__ S* scores(__gm__ K* keys,
+                                                     uint32_t bucket_capacity,
+                                                     uint32_t offset);
+};
+```
+
+### 10.2 正确 vs 错误的访问方式
+
+| 数据类型 | ❌ 错误方式 | ✅ 正确方式 |
+|----------|-------------|-------------|
+| **Key** | `bucket_keys_ptr[pos]` | `*(bucket_keys + pos)` 或 `BUCKET::keys(bucket_keys, pos)` |
+| **Digest** | `bucket_keys_ptr[pos].digest` ❌ | `BUCKET::digests(bucket_keys, bucket_capacity, pos)` ✅ |
+| **Score** | `bucket->scores_[pos]` | `BUCKET::scores(bucket_keys, bucket_capacity, pos)` |
+
+### 10.3 Digest 访问详解
+
+Digest 存储在 keys 数组之前，**必须通过静态方法访问**：
+
+```cpp
+// ✅ 正确：获取 digest 指针（指向桶内第 pos 个 digest）
+__gm__ D* digests_ptr = BUCKET::digests(bucket_keys, bucket_max_size, pos_cur);
+
+// ✅ 正确：批量读取 4 个 digest（向量化读取）
+constexpr uint32_t STRIDE = sizeof(VecD_Comp) / sizeof(D);  // = 4
+VecD_Comp probe_digests = *reinterpret_cast<__gm__ VecD_Comp*>(digests_ptr);
+
+// ✅ 正确：计算目标 digest（4 个相同字节）
+VecD_Comp target_digests = digests_from_hashed<K>(hashed_key);
+
+// ✅ 正确：比较 4 个 digest
+uint32_t cmp_result = vcmpeq4(probe_digests, target_digests);
+```
+
+**常见错误**：
+```cpp
+// ❌ 错误：digest 不是 key 的成员
+D probe_digest = bucket_keys_ptr[digest_pos].digest;
+
+// ❌ 错误：不能直接通过 bucket 指针访问 digests_
+D digest = bucket->digests_[pos];
+```
+
+### 10.4 完整示例：Digest 比较流程
+
+```cpp
+using BUCKET = Bucket<K, V, S>;
+constexpr uint32_t STRIDE = sizeof(VecD_Comp) / sizeof(D);  // = 4
+
+// 1. 计算目标 digest（4 个相同字节）
+const K hashed_key = Murmur3HashDevice(key);
+VecD_Comp target_digests = digests_from_hashed<K>(hashed_key);
+
+// 2. 线性探测
+for (uint32_t offset = 0; offset < bucket_capacity; offset += STRIDE) {
+  uint32_t pos_cur = (key_pos + offset) & (bucket_capacity - 1);
+
+  // 3. 获取 digest 指针（正确方式）
+  __gm__ D* digests_ptr = BUCKET::digests(bucket_keys, bucket_capacity, pos_cur);
+
+  // 4. 批量读取 4 个 digest
+  VecD_Comp probe_digests = *reinterpret_cast<__gm__ VecD_Comp*>(digests_ptr);
+
+  // 5. 比较 4 个 digest
+  uint32_t cmp_result = vcmpeq4(probe_digests, target_digests);
+  cmp_result &= 0x01010101;
+
+  // 6. 处理匹配结果
+  while (cmp_result != 0) {
+    uint32_t index = (Simt::Ffs(static_cast<int32_t>(cmp_result)) - 1) >> 3;
+    cmp_result &= (cmp_result - 1);
+    uint32_t possible_pos = pos_cur + index;
+
+    // 验证完整 key
+    auto current_key_ptr = BUCKET::keys(bucket_keys, possible_pos);
+    K current_key = *current_key_ptr;
+    if (current_key == key) {
+      // 找到匹配
+    }
+  }
+}
+```
+
+### 10.5 Key 和 Score 的访问
+
+```cpp
+// Key 访问
+__gm__ K* current_key_ptr = BUCKET::keys(bucket_keys, pos);
+K current_key = *current_key_ptr;
+
+// Score 访问
+__gm__ S* scores_ptr = BUCKET::scores(bucket_keys, bucket_capacity, pos);
+S score = *scores_ptr;
+
+// 原子操作
+K prev = Simt::AtomicCas(current_key_ptr, EMPTY_KEY, LOCKED_KEY);
+atomicAdd(scores_ptr, increment);
+```
+
+---
+
 ## 思考要求
 
 **在思考过程中只做以下分析**（不在思考中写代码）：
 1. CUDA kernel 的算法流程梳理（分步骤）
-2. 参数映射决策（哪些参数变 GM_ADDR，哪些保持原类型）
-3. 需要增加哪些 AscendC 特有参数（`block_index`, `thread_all` 等）
-4. 使用 ScoreFunctor 的策略（如果 CUDA 版本有类似逻辑）
-5. `THREAD_NUM` 选择依据
+2. 调用场景分析（确定 kernel 类型、线程数、group size、淘汰策略等）
+3. 参数映射决策（哪些参数变 GM_ADDR，哪些保持原类型）
+4. 需要增加哪些 AscendC 特有参数（`block_index`, `thread_all` 等）
+5. 使用 ScoreFunctor 的策略（如果 CUDA 版本有类似逻辑）
+6. `THREAD_NUM` 选择依据
 
 **完整代码只在最终输出中给出。**
 
@@ -288,6 +778,7 @@ extern "C" __global__ __aicore__ void {kernel_name}(
 3. **风格一致**：与参考 AscendC kernel 文件（clear_kernel, find_and_update_kernel 等）风格保持一致
 4. **完整可编译**：生成的头文件必须语法完整，包含所有必要的头文件和宏定义
 5. **注释保留**：保留 CUDA 源码中有意义的注释，并翻译为中文
+6. **可集成**：代码必须能正确集成到 HierarchicalKV-ascend 项目并编译通过
 
 ---
 

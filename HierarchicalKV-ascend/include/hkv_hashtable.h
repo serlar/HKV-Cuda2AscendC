@@ -47,6 +47,7 @@
 #include "aclnnop/aclnn_reduce_sum.h"
 #include "aclrtlaunch_rehash_kernel.h"
 #include "aclrtlaunch_insert_and_evict_kernel.h"
+#include "aclrtlaunch_find_or_insert_ptr_kernel_lock_key.h"
 #include "bucket_memory_pool_manager.h"
 #include "hashtable_options.h"
 #include "memory_pool.h"
@@ -1356,7 +1357,15 @@ class HashTable : public HashTableBase<K, V, S> {
       return;
     }
 
-    throw std::runtime_error("find_or_insert_ptr_kernel_v2 该 kernel 未实现");
+    ACLRT_LAUNCH_KERNEL(find_or_insert_ptr_kernel_lock_key)
+    (block_dim_, stream, table_->buckets, table_->buckets_size,
+     table_->capacity, options_.max_bucket_size, value_move_opt_.dim,
+     const_cast<key_type*>(keys), values, scores, locked_key_ptrs, n, founds,
+     global_epoch_, evict_strategy, value_move_opt_.size,
+     table_->max_bucket_shift, table_->capacity_divisor_magic,
+     table_->capacity_divisor_shift);
+
+    NpuCheckError();
   }
 
   /**

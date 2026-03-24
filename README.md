@@ -38,7 +38,7 @@ HKVMigrationAgent/
 
 ### 环境要求
 
-- AscendC CANN 8.0+
+- AscendC CANN 9.0+
 - [OpenCode](https://opencode.ai/)（已正确安装并配置）
 
 ### 安装
