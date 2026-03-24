@@ -48,6 +48,7 @@
 #include "aclrtlaunch_rehash_kernel.h"
 #include "aclrtlaunch_insert_and_evict_kernel.h"
 #include "aclrtlaunch_find_or_insert_ptr_kernel_lock_key.h"
+#include "aclrtlaunch_upsert_with_io_kernel.h"
 #include "bucket_memory_pool_manager.h"
 #include "hashtable_options.h"
 #include "memory_pool.h"
@@ -1075,7 +1076,27 @@ class HashTable : public HashTableBase<K, V, S> {
       return;
     }
 
-    throw std::runtime_error("insert_or_assign_kernel/insert_or_assign_kernel_with_thread_1024 该 kernel 未实现");
+    if (!ignore_evict_strategy) {
+      check_evict_strategy(scores);
+    }
+
+    while (!reach_max_capacity_ &&
+           fast_load_factor(n, stream) > options_.max_load_factor) {
+      reserve(capacity() * 2, stream);
+    }
+
+    uint64_t n_align_warp = ((n + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+
+    ACLRT_LAUNCH_KERNEL(upsert_with_io_kernel)(
+        block_dim_, stream, table_->buckets, table_->buckets_size,
+        table_->capacity, options_.max_bucket_size, value_move_opt_.dim,
+        const_cast<key_type*>(keys), const_cast<value_type*>(values),
+        const_cast<score_type*>(scores), n, global_epoch_,
+        static_cast<int32_t>(evict_strategy_), value_move_opt_.size,
+        table_->max_bucket_shift, table_->capacity_divisor_magic,
+        table_->capacity_divisor_shift, n_align_warp);
+
+    NpuCheckError();
   }
 
   /**

@@ -757,6 +757,118 @@ atomicAdd(scores_ptr, increment);
 
 ---
 
+## 11. Cooperative Group 编程经验（关键！）
+
+**在使用 `__shfl` 等 cooperative group 操作时必须严格遵守以下规则，否则会导致死锁或 MPU 地址访问错误。**
+
+### 11.1 严禁提前退出
+
+| 场景 | ❌ 错误做法 | ✅ 正确做法 |
+|------|-------------|-------------|
+| **空指针检查** | `if (ptr == nullptr) return;` | 检查指针但继续执行循环，通过条件判断跳过实际操作 |
+| **范围检查** | `if (idx >= n) return;` | 使用 `n_align_warp` 作为循环边界，或用条件标记跳过 |
+
+**原因**：`__shfl` 要求 warp 内所有线程参与，任何线程提前退出都会导致其他线程在 `__shfl` 处无限等待。
+
+### 11.2 循环边界对齐
+
+```cpp
+// ❌ 错误：使用 n 作为边界，导致 warp 分歧
+for (uint64_t kv_idx = block_index * blockDim.x + threadIdx.x;
+     kv_idx < n; kv_idx += thread_all) {  // 不同步！
+
+// ✅ 正确：使用 n_align_warp，确保 warp 内所有线程同时退出循环
+for (uint64_t kv_idx = block_index * blockDim.x + threadIdx.x;
+     kv_idx < n_align_warp; kv_idx += thread_all) {
+    if (kv_idx < n) {  // 内部判断实际工作范围
+        // 执行操作
+    } else {
+        // 设置标记，参与 cooperative group 但不执行实际工作
+        occupy_result = OccupyResult::ILLEGAL;
+    }
+}
+```
+
+### 11.3 线程同步机制选择
+
+| 机制 | 适用场景 | 注意事项 |
+|------|----------|----------|
+| `__shfl` | warp 内线程间数据交换 | 必须确保所有线程到达，不能有条件提前 return |
+| `__shfl_xor` | reduction 操作（求最小值/最大值） | 同上 |
+| `__threadfence()` | global memory 写操作同步 | 在写入 value 后调用，确保数据可见性 |
+| `Simt::ThreadBarrier()` | block 级同步 | 与 `__shfl` 混合使用可能导致死锁，慎用 |
+
+### 11.4 Value 复制的正确模式
+
+```cpp
+// ❌ 错误：使用局部 buffer 中转
+VecV local_buffer[GROUP_BUF];  // 栈开销大，增加内存操作
+CopyValue::ldg_sts(rank, local_buffer, src, dim);
+CopyValue::lds_stg(rank, dst, local_buffer, dim);
+
+// ✅ 正确：直接使用 __shfl 协调，直接写入 global memory
+for (int32_t i = 0; i < GROUP_SIZE; i++) {
+    auto res_sync = __shfl(occupy_result, i, GROUP_SIZE);
+    if (res_sync != OccupyResult::REFUSED && 
+        res_sync != OccupyResult::ILLEGAL) {
+        auto kv_idx_sync = __shfl(kv_idx, i, GROUP_SIZE);
+        auto value_start = kv_idx_sync * dim;
+        auto key_pos_sync = __shfl(key_pos, i, GROUP_SIZE);
+        uint64_t value_ddr_sync = __shfl(bucket_values_uintptr, i, GROUP_SIZE);
+        
+        for (uint32_t j = cg_rank_id; j < dim; j += GROUP_SIZE) {
+            __stg<ST_L2CacheType::L2_CACHE_HINT_NORMAL_FV,
+                  L1CacheType::NON_CACHEABLE>(
+                reinterpret_cast<__gm__ V*>(value_ddr_sync) + 
+                    key_pos_sync * dim + j,
+                values[value_start + j]);
+        }
+    }
+}
+```
+
+### 11.5 参数传递一致性
+
+```cpp
+// .cpp 文件
+cur_score = (evict_strategy == kLru || evict_strategy == kEpochLru) 
+            ? GetSystemCycle() : 0;
+
+// .h _vf 函数接收
+template <typename K, typename V, typename S, int32_t Strategy>
+__simt_vf__ __aicore__ void kernel_vf(
+    GM_ADDR buckets, ..., S cur_score,  // 作为参数传入，不要在 _vf 内调用 GetSystemCycle()
+    ...)
+```
+
+### 11.6 典型错误模式
+
+**错误 1：条件提前 return 导致死锁**
+```cpp
+__simt_vf__ __aicore__ void kernel(...) {
+    if (buckets_addr_gm == nullptr) {
+        return;  // ❌ 错误！其他线程会卡在 __shfl
+    }
+    // ... cooperative group 操作
+}
+```
+
+**错误 2：混合使用 barrier 和 shfl**
+```cpp
+Simt::ThreadBarrier();  // 线程 A 到达
+auto x = __shfl(val, 1);  // 线程 B 还没到达 barrier，死锁！
+```
+
+**错误 3：指针类型不匹配**
+```cpp
+__gm__ VecV* bucket_values_ptr;  // VecV 可能是 byte16
+bucket_values_ptr = reinterpret_cast<__gm__ VecV*>(bucket->vectors);  // vectors 是 V*
+// 应该用 uint64_t 存储地址，使用时再转换
+uint64_t bucket_values_uintptr = reinterpret_cast<uint64_t>(bucket->vectors);
+```
+
+---
+
 ## 思考要求
 
 **在思考过程中只做以下分析**（不在思考中写代码）：
