@@ -97,11 +97,10 @@ cp -r skills/ ~/.config/opencode/
 目标：cuda_HKV_reference/upsert.cuh            →  生成 insert_or_assign_kernel
 ```
 
-在 OpenCode 中，通过 `/agents` 命令切换至 `HKV-Migration`，然后输入：
+在 OpenCode 中，通过 `/skills` 命令切换至 `ascendc-kernel-generator`，然后输入：
 
 ```text
-参考 insert_and_evict_kernel 的实现，迁移 upsert.cuh 中的 tlp_v2_upsert_kernel_with_io，
-输出到 HierarchicalKV-ascend/hkv_hashtable/upsert_with_io_kernel/
+请根据Upsert.cuh/tlp_v2_upsert_kernel_with_io的cuda hkv算子实现一个对应功能AscendC算子, 进而完成insert_or_assign_impl的功能实现。
 ```
 
 **执行流程**：

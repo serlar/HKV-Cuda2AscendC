@@ -122,7 +122,7 @@ __forceinline__ __device__ VecD_Comp digests_from_hashed(K hashed_key);
 
 | 数据类型 | ❌ 错误方式 | ✅ 正确方式 |
 |----------|-------------|-------------|
-| **Key** | `bucket_keys_ptr[pos]` | `*(bucket_keys + pos)` 或 `BUCKET::keys(bucket_keys, pos)` |
+| **Key** | `bucket_keys_ptr[pos].digest` ❌ | `*(bucket_keys + pos)` 或 `BUCKET::keys(bucket_keys, pos)` ✅ |
 | **Digest** | `bucket_keys_ptr[pos].digest` ❌ | `BUCKET::digests(bucket_keys, bucket_capacity, pos)` ✅ |
 | **Score** | `bucket->scores_[pos]` | `BUCKET::scores(bucket_keys, bucket_capacity, pos)` |
 
@@ -276,20 +276,9 @@ ScoreFunctor::update_with_digest(
 | 查找时更新已有 key 的 score | `ScoreFunctor::update_score_only()` |
 | 插入时设置新 key 的 score | `ScoreFunctor::update_with_digest()` |
 
-### 6.2 Score 处理与淘汰策略
-
-| CUDA | AscendC |
-|------|---------|
-| `ScoreFunctor<K,V,S,Strategy>` 模板参数 | 相同 |
-| `ScoreFunctor::desired_when_missed()` | 相同 |
-| `ScoreFunctor::update_with_digest()` | `ScoreFunctor::update_with_digest()` 或 `update_score_only()` |
-| `global_epoch` 参数 | 相同 |
-| `system_cycle` | `AscendC::GetSystemCycle()` |
-
-**映射规律**：
-- 纯查找（不更新 score）：无 Strategy 模板参数
-- 查找+更新 score：有 Strategy 参数，使用 `update_score_only()`
-- 插入操作：使用 `update_with_digest()`
+**参数说明**：
+- `global_epoch`: 当前 epoch，用于基于时间的淘汰策略（如 EpochLru）
+- `system_cycle`: 系统时钟周期，通过 `AscendC::GetSystemCycle()` 获取
 
 ---
 
@@ -341,25 +330,9 @@ enum class OccupyResult : uint32_t {
 
 ---
 
-## 9. 线程处理模式
+## 9. 锁机制差异
 
-### 9.1 CUDA vs AscendC 线程模式
-
-| CUDA 模式 | AscendC 模式 | 适用算子 |
-|-----------|--------------|----------|
-| TLP (1线程1key) | SIMT (1线程1key) | `find_ptr`, `find_and_update` |
-| TLP + GROUP (协作组) | SIMT + `__shfl` 协作 | `insert_and_evict`, `insert_or_assign` |
-
-**关键差异**：
-- CUDA 使用 `cg::tiled_partition<GROUP_SIZE>` 显式创建协作组
-- AscendC 使用 `__shfl` 系列指令在指定 GROUP 内交换数据
-- AscendC 需要手动计算 group rank：`threadIdx.x % GROUP_SIZE`
-
----
-
-## 10. 锁机制差异
-
-### 10.1 rehash_kernel 锁机制
+### 9.1 rehash_kernel 锁机制
 
 | 机制 | CUDA | AscendC |
 |------|------|---------|
@@ -373,7 +346,7 @@ enum class OccupyResult : uint32_t {
 - AscendC 使用 `Simt::AtomicCas` 原子操作锁定单个 key 位置，粒度更细
 - 两者都使用**两阶段**处理：先移动 key 到新 bucket，再进行碎片整理
 
-### 10.2 通用锁定/解锁模式
+### 9.2 通用锁定/解锁模式
 
 ```cpp
 // 锁定 key 位置
@@ -388,7 +361,7 @@ if (prev == EMPTY_KEY) {
 
 ---
 
-## 11. 初始化操作差异（init_table_kernel）
+## 10. 初始化操作差异（init_table_kernel）
 
 | 操作 | CUDA | AscendC |
 |------|------|---------|
@@ -405,106 +378,31 @@ if (prev == EMPTY_KEY) {
 
 ---
 
-## 12. AscendC 算子调用方式（Dispatcher 模式）
+## 11. AscendC 算子调用方式（Dispatcher 模式）
 
-### 12.1 文件结构
+> **注意**：完整的 Dispatcher 模板和分发宏说明请参考 `ascendc-simt-patterns.md` 第 10 节。
+> 本文档仅列出关键规则和算子特定参数。
 
-每个算子包含两个文件：
-1. **Kernel 实现**：`v35/{kernel_name}_kernel.h`（含 `_vf` 后缀的函数）
-2. **Dispatcher**：`{kernel_name}_kernel.cpp`（`extern "C" __global__ __aicore__` 入口）
+### 11.1 分发宏使用场景
 
-### 12.2 Dispatcher 模板
+| 宏 | 适用算子 | 说明 |
+|----|----------|------|
+| `DISPATCH_VALUE_SIZE` | **所有算子** | 必须，用于将 `value_size` 映射为 `DTYPE` |
+| `DISPATCH_EVICT_STRATEGY` | `find_and_update`, `insert_and_evict`, `insert_or_assign` | 涉及 Score 更新的算子 |
+| `DISPATCH_GROUP_SIZE` | `insert_and_evict`, `dump_kernel` | 使用协作组的算子 |
 
-```cpp
-// {kernel_name}_kernel.cpp
-#include "./v35/{kernel_name}_kernel.h"
-#include "../../include/simt_vf_dispatcher.h"
-#include "kernel_operator.h"
+### 11.2 算子特定参数
 
-using namespace npu::hkv;
-
-extern "C" __global__ __aicore__ void {kernel_name}(
-    GM_ADDR buckets,
-    // ... 其他 GM_ADDR 和标量参数 ...
-    uint32_t value_size,              // 必须：用于类型分发
-    int32_t evict_strategy) {         // 可选：用于淘汰策略分发
-
-  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-
-  const uint64_t thread_all = THREAD_NUM * GetBlockNum();
-
-  // 简单算子：仅 value_size 分发
-  DISPATCH_VALUE_SIZE(
-      value_size,
-      (Simt::VF_CALL<{kernel_name}_vf<uint64_t, DTYPE, uint64_t>>(
-          Simt::Dim3{static_cast<uint32_t>(THREAD_NUM)},
-          buckets, /* ... 其他参数 ... */, thread_all, GetBlockIdx())));
-
-  // 复杂算子：多层分发
-  DISPATCH_GROUP_SIZE(
-      group_size,
-      DISPATCH_VALUE_SIZE(
-          value_size,
-          DISPATCH_EVICT_STRATEGY(
-              evict_strategy,
-              (Simt::VF_CALL<{kernel_name}_vf<uint64_t, DTYPE, uint64_t, STRATEGY, GROUP_SIZE>>(
-                  Simt::Dim3{static_cast<uint32_t>(THREAD_NUM)},
-                  buckets, /* ... 其他参数 ... */, thread_all, GetBlockIdx())))));
-}
-```
-
-### 12.3 分发宏说明
-
-#### `DISPATCH_VALUE_SIZE(value_size, FUNC)`
-- 将 `value_size`（1/2/4/8/16）映射为 `DTYPE` 模板参数
-- `DTYPE` 对应：`int8_t`, `int16_t`, `int32_t`, `int64_t`, `int4`
-- **所有算子都必须使用**
-
-#### `DISPATCH_EVICT_STRATEGY(strategy, FUNC)`
-- 将 `strategy` 映射为 `STRATEGY` 模板参数
-- 支持：kLru, kLfu, kEpochLru, kEpochLfu, kCustomized
-- **涉及 Score 更新的算子需要使用**
-
-#### `DISPATCH_GROUP_SIZE(group_size, FUNC)`
-- 将 `group_size`（2/4/8/16/32）映射为 `GROUP_SIZE` 模板参数
-- **涉及协作组的算子需要使用**（如 insert_and_evict）
-
-### 12.4 Host 端调用方式
-
-```cpp
-// 包含 aclrtlaunch 头文件
-#include "aclrtlaunch_find_ptr_with_digest_kernel.h"
-
-// 调用 kernel
-ACLRT_LAUNCH_KERNEL(find_ptr_with_digest_kernel)(
-    block_dim_,           // block 维度
-    stream,               // CANN stream
-    table_->buckets,      // GM_ADDR 参数...
-    table_->capacity,
-    options_.max_bucket_size,
-    options_.dim,
-    keys, values, scores, founds, n, global_epoch_,
-    value_size_,          // 用于 DISPATCH_VALUE_SIZE
-    table_->max_bucket_shift,
-    table_->capacity_divisor_magic,
-    table_->capacity_divisor_shift
-);
-```
-
-### 12.5 参数传递规则
-
-| 参数类型 | 说明 |
-|----------|------|
-| `GM_ADDR` | 全局内存指针（设备内存地址） |
-| `uint64_t` | 容量、数量等 64 位整数 |
-| `uint32_t` | 维度、大小等 32 位整数 |
-| `value_size` | 必须传入，用于类型分发（`sizeof(V)`） |
-| `evict_strategy` | 涉及 Score 时传入，用于策略分发 |
-| `group_size` | 涉及协作组时传入 |
+| 参数 | 类型 | 适用算子 | 说明 |
+|------|------|----------|------|
+| `update_score` | `bool` | `find_and_update` | 是否更新已有 key 的 score |
+| `global_epoch` | `uint64_t` | 带 Strategy 的算子 | 当前 epoch，用于 score 计算 |
+| `system_cycle` | `uint64_t` | 部分带 Strategy 算子 | `AscendC::GetSystemCycle()` 获取 |
+| `is_train_mode` | `bool` | `find_ptr` 等 | 训练模式标志（部分算子有） |
 
 ---
 
-## 13. 测试辅助函数（test_util.h）
+## 12. 测试辅助函数（test_util.h）
 
 在生成测试文件时使用：
 
@@ -540,7 +438,7 @@ void create_random_keys(
 
 ---
 
-## 14. HashTable 公共接口（hkv_hashtable.h）
+## 13. HashTable 公共接口（hkv_hashtable.h）
 
 测试中通过 `HashTable<K, V>` 的公共接口调用各 kernel：
 
@@ -570,14 +468,3 @@ class HashTable {
 
 }  // namespace npu::hkv
 ```
-
----
-
-## 15. 返回值处理模式
-
-| 操作 | CUDA | AscendC |
-|------|------|---------|
-| 返回 value 指针 | `values[kv_idx] = bucket_values_ptr + key_pos * dim` | 相同 |
-| 返回 score | `scores[kv_idx] = *bucket_scores_ptr` | 相同 |
-| 返回 found 标志 | `founds[kv_idx] = found` | 相同 |
-| 淘汰计数 | `atomicAdd(evicted_counter, 1)` | 相同 |
