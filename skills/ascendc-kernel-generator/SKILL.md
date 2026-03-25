@@ -25,6 +25,51 @@ argument-hint: >
 4. 分析编译错误并进行迭代修复（最多3次）
 </role>
 
+## 算子映射参考表
+
+在不确定迁移实现时，参考以下算子映射关系查看相关代码：
+
+### 待迁移算子（目标）
+
+这些是本 Skill 需要生成的目标算子：
+
+| CUDA算子 | CUDA文件 | 功能描述 | AscendC目标算子 |
+|----------|----------|----------|----------------|
+| `tlp_update_score_kernel` | `cuda_HKV_reference/update_score.cuh` | 为指定 key 批量更新 score | `assign_scores_kernel` |
+| `find_or_insert_ptr_kernel_lock_key` | `cuda_HKV_reference/find_ptr_or_insert.cuh` | 查找 key 返回指针，不存在则插入 | `find_or_insert_ptr_kernel` |
+| `tlp_lookup_ptr_kernel_with_filter` (update_score=false) | `cuda_HKV_reference/lookup_ptr.cuh:26` | 纯查找 key 并返回 value 指针 | `find_ptr_kernel` |
+| `tlp_v2_upsert_kernel_with_io` | `cuda_HKV_reference/upsert.cuh` | 插入或更新 key-value | `insert_or_assign_kernel` |
+
+### 参考算子（已完成映射）
+
+生成时可参考以下已完成的算子对：
+
+| CUDA算子 | CUDA文件 | AscendC算子 | AscendC文件 | 功能 | 参考价值 |
+|----------|----------|-------------|-------------|------|----------|
+| `tlp_lookup_ptr_kernel_with_filter` (update分支) | `lookup_ptr.cuh:26` | `find_and_update_kernel` | `find_and_update_kernel/v35/find_and_update_kernel.h` | 查找 key 并更新 score | **查找类算子通用模式** |
+| `tlp_v1_upsert_and_evict_kernel_unique` | `upsert_and_evict.cuh:27` | `insert_and_evict_kernel` | `insert_and_evict_kernel/v35/insert_and_evict_kernel.h` | 插入 key，满时淘汰 | **插入+淘汰模式** |
+| `clear_kernel` | `core_kernels.cuh:643` | `clear_kernel` | `clear_kernel/v35/clear_kernel.h` | 清空哈希表槽位 | **批量初始化模式** |
+| `dump_kernel` | `core_kernels.cuh:832` | `dump_kernel` | `dump_kernel/v35/dump_kernel.h` | 导出 key-value-score | **遍历输出模式** |
+| `create_atomic_keys/scores` | `core_kernels.cuh:57` | `init_table_kernel` | `init_table_kernel/v35/init_table_kernel.h` | 初始化哈希桶 | **内存初始化模式** |
+| `rehash_kernel_for_fast_mode` | `core_kernels.cuh:519` | `rehash_kernel` | `rehash_kernel/v35/rehash_kernel.h` | 重哈希 | **锁机制实现** |
+
+### 映射规律总结
+
+1. **纯查找类算子**（无 Score 更新）：`find_ptr_kernel`
+   - 无 Strategy 模板参数
+   - 无 `update_score` 参数
+   - 使用 `ldg_l2nc_l1c` 加载数据，无原子锁操作
+
+2. **查找+更新类算子**（有 Score 更新）：`find_and_update_kernel`
+   - 有 Strategy 模板参数（用于 ScoreFunctor）
+   - 有 `update_score` 参数控制是否更新
+   - 使用 `AtomicCas` 锁定/解锁
+
+3. **插入淘汰类算子**：`insert_and_evict_kernel`
+   - 使用协作组（GROUP_SIZE）进行并行淘汰
+   - 有 `evicted_keys/values/scores` 输出参数
+   - 使用 `DISPATCH_GROUP_SIZE` 宏分发
+
 ## 输入信息
 
 你将获得以下信息：
@@ -43,7 +88,39 @@ argument-hint: >
 - **AscendC SIMT 编程模式**：`@references/ascendc-simt-patterns.md`
   - 函数签名规范、GM_ADDR 用法、线程索引、原子操作等
 - **HKV 数据结构参考**：`@references/hkv-data-structures.md`
-  - Bucket 结构、常量定义、哈希函数、ScoreFunctor
+  - Bucket 结构、常量定义、哈希函数、ScoreFunctor、算子 API 依赖
+
+## 代码参考指引
+
+当不确定迁移实现时，按以下优先级查看参考代码：
+
+### 1. 确定目标算子类型
+根据 CUDA kernel 功能，确定属于以下哪种类型：
+- **纯查找类**（无 Score 更新）：参考 `find_ptr_kernel` 模式
+- **查找+更新类**（有 Score 更新）：参考 `find_and_update_kernel` 模式
+- **插入淘汰类**（含协作组）：参考 `insert_and_evict_kernel` 模式
+- **初始化类**：参考 `init_table_kernel`、`clear_kernel` 模式
+
+### 2. 查看对应参考实现
+
+| 目标算子 | 主要参考 | 次要参考 | 关注重点 |
+|----------|----------|----------|----------|
+| `assign_scores_kernel` | `find_and_update_kernel` | `clear_kernel` | Score 更新逻辑 |
+| `find_or_insert_ptr_kernel` | `insert_and_evict_kernel` | `find_and_update_kernel` | 锁定/解锁模式、插入逻辑 |
+| `find_ptr_kernel` | `find_and_update_kernel` | - | 纯查找模式（无 Score 更新） |
+| `insert_or_assign_kernel` | `insert_and_evict_kernel` | `find_and_update_kernel` | 插入逻辑、协作组使用 |
+
+### 3. 代码对比步骤
+
+1. **对比 CUDA 代码结构**：先阅读目标 CUDA kernel，标记关键逻辑点
+2. **参考 AscendC 实现**：查看参考算子的 AscendC 实现，理解对应逻辑
+3. **识别差异点**：特别关注参数封装、线程模型、锁机制的差异
+4. **应用到目标算子**：将参考模式应用到目标算子的生成中
+
+### 4. 参考文件位置
+
+- **CUDA 参考代码**：`cuda_HKV_reference/{kernel_name}.cuh`
+- **AscendC 参考代码**：`HierarchicalKV-ascend/hkv_hashtable/{kernel_name}_kernel/v35/{kernel_name}_kernel.h`
 
 ## 执行流程
 
@@ -621,251 +698,24 @@ extern "C" __global__ __aicore__ void {kernel_name}(
 | 约束 | 说明 |
 |------|------|
 | **目录结构** | 必须创建 `v35/` 子目录，.h 文件放其中，.cpp 放顶层 |
-| **文件名** | `.h`: `v35/{kernel_name}_kernel.h`；`.cpp`: `{kernel_name}_kernel.cpp` |
+| **文件名** | `.h`: `v35/{kernel_name}_kernel.h`是执行在NPU的算子核心计算逻辑；`.cpp`: `{kernel_name}_kernel.cpp` 是算子的调用函数|
 | **宏定义** | .h 文件必须使用 `ASCENDC_{UPPER}_KERNEL_H_` 保护宏 |
-| **函数名** | `_vf` 函数名为 `{kernel_name}_vf`；`.cpp` 入口函数为 `{kernel_name}` |
 | **命名空间** | 两个文件都必须在 `namespace npu { namespace hkv {` 内 |
 | `THREAD_NUM` | 根据 CUDA kernel 的 blockDim 对应值选 512 或 1024 |
 | **dispatcher 关键** | .cpp 中 `GetBlockIdx()` 返回当前 block index，作为 `block_index` 参数传入 _vf |
-| **DISPATCH** | 必须包含 `DISPATCH_VALUE_SIZE`；有 ScoreFunctor 时还需 `DISPATCH_EVICT_STRATEGY` |
 | `Simt::VF_CALL` | 固定包装，第一参数为 `Simt::Dim3{THREAD_NUM}` |
-| **include 路径** | .h 使用 `../../../include/`；.cpp 使用 `../../include/` |
 | **入口修饰符** | .cpp 函数必须是 `extern "C" __global__ __aicore__` |
 
 ---
 
-## 10. HKV 数据访问方式（重要！）
+## 参考文档
 
-**严禁使用错误的数据访问方式！** 以下是 HKV 中各类数据的正确访问方法：
+详细编程经验和数据访问方式请参考：
 
-### 10.1 Bucket 数据结构
-
-```cpp
-template <class K, class V, class S>
-struct Bucket {
-  __gm__ K* keys_;       // key 数组
-  __gm__ S* scores_;     // score 数组
-  __gm__ D* digests_;    // digest 数组（1字节摘要）
-  __gm__ V* vectors;     // value 向量数组
-
-  // 静态方法：获取 keys 指针
-  static __forceinline__ __device__ __gm__ K* keys(__gm__ K* keys, uint32_t offset);
-
-  // 静态方法：获取 digests 指针（重要！）
-  static __forceinline__ __device__ __gm__ D* digests(__gm__ K* keys,
-                                                      uint32_t bucket_capacity,
-                                                      uint32_t offset);
-
-  // 静态方法：获取 scores 指针
-  static __forceinline__ __device__ __gm__ S* scores(__gm__ K* keys,
-                                                     uint32_t bucket_capacity,
-                                                     uint32_t offset);
-};
-```
-
-### 10.2 正确 vs 错误的访问方式
-
-| 数据类型 | ❌ 错误方式 | ✅ 正确方式 |
-|----------|-------------|-------------|
-| **Key** | `bucket_keys_ptr[pos]` | `*(bucket_keys + pos)` 或 `BUCKET::keys(bucket_keys, pos)` |
-| **Digest** | `bucket_keys_ptr[pos].digest` ❌ | `BUCKET::digests(bucket_keys, bucket_capacity, pos)` ✅ |
-| **Score** | `bucket->scores_[pos]` | `BUCKET::scores(bucket_keys, bucket_capacity, pos)` |
-
-### 10.3 Digest 访问详解
-
-Digest 存储在 keys 数组之前，**必须通过静态方法访问**：
-
-```cpp
-// ✅ 正确：获取 digest 指针（指向桶内第 pos 个 digest）
-__gm__ D* digests_ptr = BUCKET::digests(bucket_keys, bucket_max_size, pos_cur);
-
-// ✅ 正确：批量读取 4 个 digest（向量化读取）
-constexpr uint32_t STRIDE = sizeof(VecD_Comp) / sizeof(D);  // = 4
-VecD_Comp probe_digests = *reinterpret_cast<__gm__ VecD_Comp*>(digests_ptr);
-
-// ✅ 正确：计算目标 digest（4 个相同字节）
-VecD_Comp target_digests = digests_from_hashed<K>(hashed_key);
-
-// ✅ 正确：比较 4 个 digest
-uint32_t cmp_result = vcmpeq4(probe_digests, target_digests);
-```
-
-**常见错误**：
-```cpp
-// ❌ 错误：digest 不是 key 的成员
-D probe_digest = bucket_keys_ptr[digest_pos].digest;
-
-// ❌ 错误：不能直接通过 bucket 指针访问 digests_
-D digest = bucket->digests_[pos];
-```
-
-### 10.4 完整示例：Digest 比较流程
-
-```cpp
-using BUCKET = Bucket<K, V, S>;
-constexpr uint32_t STRIDE = sizeof(VecD_Comp) / sizeof(D);  // = 4
-
-// 1. 计算目标 digest（4 个相同字节）
-const K hashed_key = Murmur3HashDevice(key);
-VecD_Comp target_digests = digests_from_hashed<K>(hashed_key);
-
-// 2. 线性探测
-for (uint32_t offset = 0; offset < bucket_capacity; offset += STRIDE) {
-  uint32_t pos_cur = (key_pos + offset) & (bucket_capacity - 1);
-
-  // 3. 获取 digest 指针（正确方式）
-  __gm__ D* digests_ptr = BUCKET::digests(bucket_keys, bucket_capacity, pos_cur);
-
-  // 4. 批量读取 4 个 digest
-  VecD_Comp probe_digests = *reinterpret_cast<__gm__ VecD_Comp*>(digests_ptr);
-
-  // 5. 比较 4 个 digest
-  uint32_t cmp_result = vcmpeq4(probe_digests, target_digests);
-  cmp_result &= 0x01010101;
-
-  // 6. 处理匹配结果
-  while (cmp_result != 0) {
-    uint32_t index = (Simt::Ffs(static_cast<int32_t>(cmp_result)) - 1) >> 3;
-    cmp_result &= (cmp_result - 1);
-    uint32_t possible_pos = pos_cur + index;
-
-    // 验证完整 key
-    auto current_key_ptr = BUCKET::keys(bucket_keys, possible_pos);
-    K current_key = *current_key_ptr;
-    if (current_key == key) {
-      // 找到匹配
-    }
-  }
-}
-```
-
-### 10.5 Key 和 Score 的访问
-
-```cpp
-// Key 访问
-__gm__ K* current_key_ptr = BUCKET::keys(bucket_keys, pos);
-K current_key = *current_key_ptr;
-
-// Score 访问
-__gm__ S* scores_ptr = BUCKET::scores(bucket_keys, bucket_capacity, pos);
-S score = *scores_ptr;
-
-// 原子操作
-K prev = Simt::AtomicCas(current_key_ptr, EMPTY_KEY, LOCKED_KEY);
-atomicAdd(scores_ptr, increment);
-```
-
----
-
-## 11. Cooperative Group 编程经验（关键！）
-
-**在使用 `__shfl` 等 cooperative group 操作时必须严格遵守以下规则，否则会导致死锁或 MPU 地址访问错误。**
-
-### 11.1 严禁提前退出
-
-| 场景 | ❌ 错误做法 | ✅ 正确做法 |
-|------|-------------|-------------|
-| **空指针检查** | `if (ptr == nullptr) return;` | 检查指针但继续执行循环，通过条件判断跳过实际操作 |
-| **范围检查** | `if (idx >= n) return;` | 使用 `n_align_warp` 作为循环边界，或用条件标记跳过 |
-
-**原因**：`__shfl` 要求 warp 内所有线程参与，任何线程提前退出都会导致其他线程在 `__shfl` 处无限等待。
-
-### 11.2 循环边界对齐
-
-```cpp
-// ❌ 错误：使用 n 作为边界，导致 warp 分歧
-for (uint64_t kv_idx = block_index * blockDim.x + threadIdx.x;
-     kv_idx < n; kv_idx += thread_all) {  // 不同步！
-
-// ✅ 正确：使用 n_align_warp，确保 warp 内所有线程同时退出循环
-for (uint64_t kv_idx = block_index * blockDim.x + threadIdx.x;
-     kv_idx < n_align_warp; kv_idx += thread_all) {
-    if (kv_idx < n) {  // 内部判断实际工作范围
-        // 执行操作
-    } else {
-        // 设置标记，参与 cooperative group 但不执行实际工作
-        occupy_result = OccupyResult::ILLEGAL;
-    }
-}
-```
-
-### 11.3 线程同步机制选择
-
-| 机制 | 适用场景 | 注意事项 |
-|------|----------|----------|
-| `__shfl` | warp 内线程间数据交换 | 必须确保所有线程到达，不能有条件提前 return |
-| `__shfl_xor` | reduction 操作（求最小值/最大值） | 同上 |
-| `__threadfence()` | global memory 写操作同步 | 在写入 value 后调用，确保数据可见性 |
-| `Simt::ThreadBarrier()` | block 级同步 | 与 `__shfl` 混合使用可能导致死锁，慎用 |
-
-### 11.4 Value 复制的正确模式
-
-```cpp
-// ❌ 错误：使用局部 buffer 中转
-VecV local_buffer[GROUP_BUF];  // 栈开销大，增加内存操作
-CopyValue::ldg_sts(rank, local_buffer, src, dim);
-CopyValue::lds_stg(rank, dst, local_buffer, dim);
-
-// ✅ 正确：直接使用 __shfl 协调，直接写入 global memory
-for (int32_t i = 0; i < GROUP_SIZE; i++) {
-    auto res_sync = __shfl(occupy_result, i, GROUP_SIZE);
-    if (res_sync != OccupyResult::REFUSED && 
-        res_sync != OccupyResult::ILLEGAL) {
-        auto kv_idx_sync = __shfl(kv_idx, i, GROUP_SIZE);
-        auto value_start = kv_idx_sync * dim;
-        auto key_pos_sync = __shfl(key_pos, i, GROUP_SIZE);
-        uint64_t value_ddr_sync = __shfl(bucket_values_uintptr, i, GROUP_SIZE);
-        
-        for (uint32_t j = cg_rank_id; j < dim; j += GROUP_SIZE) {
-            __stg<ST_L2CacheType::L2_CACHE_HINT_NORMAL_FV,
-                  L1CacheType::NON_CACHEABLE>(
-                reinterpret_cast<__gm__ V*>(value_ddr_sync) + 
-                    key_pos_sync * dim + j,
-                values[value_start + j]);
-        }
-    }
-}
-```
-
-### 11.5 参数传递一致性
-
-```cpp
-// .cpp 文件
-cur_score = (evict_strategy == kLru || evict_strategy == kEpochLru) 
-            ? GetSystemCycle() : 0;
-
-// .h _vf 函数接收
-template <typename K, typename V, typename S, int32_t Strategy>
-__simt_vf__ __aicore__ void kernel_vf(
-    GM_ADDR buckets, ..., S cur_score,  // 作为参数传入，不要在 _vf 内调用 GetSystemCycle()
-    ...)
-```
-
-### 11.6 典型错误模式
-
-**错误 1：条件提前 return 导致死锁**
-```cpp
-__simt_vf__ __aicore__ void kernel(...) {
-    if (buckets_addr_gm == nullptr) {
-        return;  // ❌ 错误！其他线程会卡在 __shfl
-    }
-    // ... cooperative group 操作
-}
-```
-
-**错误 2：混合使用 barrier 和 shfl**
-```cpp
-Simt::ThreadBarrier();  // 线程 A 到达
-auto x = __shfl(val, 1);  // 线程 B 还没到达 barrier，死锁！
-```
-
-**错误 3：指针类型不匹配**
-```cpp
-__gm__ VecV* bucket_values_ptr;  // VecV 可能是 byte16
-bucket_values_ptr = reinterpret_cast<__gm__ VecV*>(bucket->vectors);  // vectors 是 V*
-// 应该用 uint64_t 存储地址，使用时再转换
-uint64_t bucket_values_uintptr = reinterpret_cast<uint64_t>(bucket->vectors);
-```
+- **AscendC SIMT 编程模式**：`@references/ascendc-simt-patterns.md`
+  - 函数签名规范、GM_ADDR 用法、线程索引、原子操作、线程同步、Cooperative Group 编程经验等
+- **HKV 数据结构参考**：`@references/hkv-data-structures.md`
+  - Bucket 结构、常量定义、哈希函数、ScoreFunctor、数据访问方式、算子 API 依赖
 
 ---
 
@@ -889,8 +739,7 @@ uint64_t bucket_values_uintptr = reinterpret_cast<uint64_t>(bucket->vectors);
 2. **忠于 CUDA 原文**：不"优化"或"改进"原有算法，只做语法/API 迁移
 3. **风格一致**：与参考 AscendC kernel 文件（clear_kernel, find_and_update_kernel 等）风格保持一致
 4. **完整可编译**：生成的头文件必须语法完整，包含所有必要的头文件和宏定义
-5. **注释保留**：保留 CUDA 源码中有意义的注释，并翻译为中文
-6. **可集成**：代码必须能正确集成到 HierarchicalKV-ascend 项目并编译通过
+5. **可集成**：代码必须能正确集成到 HierarchicalKV-ascend 项目并编译通过
 
 ---
 
